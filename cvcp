@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+
+import argparse
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+RSYNC_IMAGE = "jeetparekh/rsync:latest"
+
+
+description = """
+Transfer data to and from container volumes.
+
+This script uses rsync to copy the files.
+
+Path inside a container volume should be written as <volume_name>:<path_inside_volume>.
+
+Either SOURCE or DESTINATION can be a local path or a path inside a container volume.
+Note however that both SOURCE and DESTINATION cannot be local paths.
+"""
+
+
+cmd_rsync = """
+{app} run --rm \
+-v {source}:/source_dir \
+-v {dest}:/dest_dir \
+{image} \
+rsync {rsync_opts} {source_path} {dest_path}
+"""
+
+
+def get_volume_path(arg: str):
+    arg_split = arg.split(":")
+    volume, path = arg_split[0].strip(), arg_split[1]
+    if len(volume) == 0:
+        print("Blank volume name. Exiting.", file=sys.stderr)
+        sys.exit(1)
+    if len(path) == 0:
+        print("Blank path inside volume. Exiting.", file=sys.stderr)
+        sys.exit(1)
+    return volume, path
+
+
+def get_local_source(arg: str):
+    local_path = Path(arg).absolute()
+    if not local_path.exists():
+        print("Local path does not exist. Exiting.", file=sys.stderr)
+        sys.exit(1)
+    local_dir = local_path.parent
+    local_name = local_path.name
+    return local_dir, local_name
+
+
+def get_local_dest(arg: str):
+    local_path = Path(arg).absolute()
+    is_dir = local_path.is_dir() or arg.endswith("/")
+    local_dir = f"{local_path}/" if is_dir else local_path.parent
+    local_name = "" if is_dir else local_path.name
+    return local_dir, local_name
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument("source", type=str)
+    parser.add_argument("destination", type=str)
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=RSYNC_IMAGE,
+        help="image to use for rsync. default is jeetparekh/cvcp:latest",
+    )
+    parser.add_argument(
+        "--rsync-opts",
+        type=str,
+        default=" -a --progress",
+        help="options to pass to rsync. default options are ' -a --progress'",
+    )
+    parser.add_argument(
+        "--no-exec", action="store_true", help="print the command and exit"
+    )
+    parser.add_argument(
+        "--rootless", action="store_true", help="use the container engine without root"
+    )
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--docker", const="docker", action="store_const", dest="app", help="use docker"
+    )
+    group.add_argument(
+        "--podman", const="podman", action="store_const", dest="app", help="use podman"
+    )
+
+    args = parser.parse_args()
+
+    app = args.app if args.app is not None else "docker"
+    app = app if args.rootless else f"sudo {app}"
+    rsync_opts = "" if args.rsync_opts is None else args.rsync_opts.strip()
+
+    _source = args.source
+    _dest = args.destination
+
+    is_source_cv = ":" in _source
+    is_dest_cv = ":" in _dest
+
+    if is_source_cv and is_dest_cv:
+        source, source_path = get_volume_path(_source)
+        dest, dest_path = get_volume_path(_dest)
+    elif is_source_cv:
+        source, source_path = get_volume_path(_source)
+        dest, dest_path = get_local_dest(_dest)
+    elif is_dest_cv:
+        source, source_path = get_local_source(_source)
+        dest, dest_path = get_volume_path(_dest)
+    else:
+        print(
+            "Both source and destination cannot be local paths. Exiting.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    cmd = cmd_rsync.format(
+        app=app,
+        image=args.image,
+        source=source,
+        source_path=shlex.quote(f"/source_dir/{source_path}"),
+        dest=dest,
+        dest_path=shlex.quote(f"/dest_dir/{dest_path}"),
+        rsync_opts=rsync_opts,
+    )
+
+    if args.no_exec:
+        print(cmd.strip())
+        sys.exit(0)
+
+    try:
+        subprocess.run(
+            shlex.split(cmd.strip()),
+            check=True,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+    except subprocess.CalledProcessError as ex:
+        print(ex.output, file=sys.stderr)
+        sys.exit(1)
